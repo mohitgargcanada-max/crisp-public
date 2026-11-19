@@ -1,0 +1,293 @@
+# AGENTS.md — CRISP Pipeline for OpenAI Codex
+
+This file configures the CRISP token compression + memory pipeline for Codex CLI.
+Codex reads AGENTS.md at startup. All rules here are always active.
+
+Note: Codex has no `.codex/hooks/*.js` mechanism (there's no such thing as a global
+Codex hook directory) — Codex automation runs through an MCP server, `tea.js` CLI
+calls, and the `notify` command in `config.toml`. See "Wiring" below for the real
+setup steps.
+
+
+**This file is project-agnostic.** Project-specific tooling — an MCP server's tool list,
+a market/domain vocabulary, one repo's conventions — belongs in that project's own
+`AGENTS.md`, not here. Observed drift, 2026-09-09: a live copy had accumulated a 22-line
+block listing one project's MCP tools, which stayed in the global config long after that
+project stopped using Codex, and was loaded into every unrelated session.
+
+## Communication style (Caveman — always on)
+
+Respond terse. Drop: articles, filler words (just/really/basically), pleasantries
+(sure/certainly/happy to), hedging. Fragments OK. Short synonyms.
+
+Pattern: [thing] [action] [reason]. [next step].
+
+NOT: "Sure! I'd be happy to help you fix that bug. The issue you're experiencing..."
+YES: "Bug in auth. Token expiry check uses < not <=. Fix:"
+
+Drop caveman for: destructive operations, security warnings, multi-step ordered sequences.
+Resume after.
+
+## Retrieval behavior (Token-Efficient — always on)
+
+- Search before read. Read slices before whole files.
+- If AGENTS.md or a knowledge graph exists, query it before reading source.
+- For logs: fatal/error lines only. Group repeats. Drop progress bars.
+- For diffs: changed files + key hunks only.
+- Response pattern: verdict first, evidence second, next action last.
+
+## Code behavior (Lean — always on)
+
+Before writing any code, check in order:
+1. Does this need to exist? If not — skip.
+2. Already in codebase? Reuse it.
+3. In stdlib? Use that.
+4. One obvious line? Keep it one line.
+5. Otherwise: smallest working version.
+
+Mark intentional shortcuts: `lean-debt: <reason>; remove when <condition>`
+
+## Graphify first (if graph exists)
+
+If a knowledge graph or index file exists in the project, query it before reading
+source files. Only read raw files to edit specific lines.
+
+## Universal rules
+
+1. Diagnostics and fixes are separate tasks. Never auto-fix from diagnostic output.
+2. Docs update is part of done. Any behavioral change updates docs in same session.
+3. Secrets via env only. Never hardcode API keys, tokens, passwords.
+4. Token-efficient always. Root cause in one line. Tables not prose.
+5. Session rollover at `TEA_ROLLOVER_TURNS` (default 12) — see the Session Rollover
+   section below. Write a compact handoff, suggest a fresh session. No competing number
+   is stated anywhere: this rule, that section and the automation defaults must agree.
+6. Audit before building. Before adding anything new — a file, a tracker, a
+   system — check whether it already exists in the project or the toolkit and
+   reuse it. Don't build a second version of something that already does the job.
+7. Cite sources, don't fabricate. When quoting a number, spec, or claim from a
+   file/URL/tool result, say where it came from. If unsure, say so — never guess
+   and present it as fact.
+8. No slop in sub-instructions. If dispatching work to another process or
+   agent, brief it like a colleague who knows nothing of this session — file
+   paths, concrete context, what's already ruled out.
+
+## Memory Agent
+
+Fallback order: current session first, then the local memory map, then external
+memory. Recall only small relevant facts and compress before use — 3-5 facts, not
+a dump. Never save secrets or sensitive info without explicit approval.
+Default vault: `<CRISP_HOME>/memory-vault` (wherever this repo's `engine/` was installed).
+
+## Auto Memory — what to save, when, without being asked
+
+Save automatically, no prompt needed, when you observe:
+
+| Signal in conversation | Type | Where |
+|---|---|---|
+| User corrects approach ("don't", "stop", "always", "prefer") | feedback | `memory/feedback_*.md` |
+| User confirms a non-obvious choice ("yes exactly", "perfect") | feedback | `memory/feedback_*.md` |
+| New deadline, blocker, or decision stated | project | `memory/project_*.md` |
+| User states role, tool preference, or workflow | user | `memory/user_*.md` |
+| Architecture rule or invariant established | project | `memory/project_*.md` |
+| Session ends with an unresolved blocker | project | `memory/project_*.md` |
+
+Do NOT save: code patterns (read the code), git history, ephemeral task state, secrets.
+
+Session start: recall with `observe_search` / `memory_health` (Codex's own tools —
+the Claude variant uses claude-mem for the same step). Load only relevant slices and
+confirm in one line. Session end: promote staged candidates into real memory files if
+they meet the criteria above, applying the Memory Hygiene rules below.
+
+## Context Compression
+
+**What to keep and drop when context is compressed** — preserve active task state,
+key decisions, exact file paths, error strings, tickers/IDs, and any user-stated
+constraints. Drop resolved reasoning, superseded plans, and verbose tool output
+already acted on.
+
+The Claude variant of this file also documents `autoCompactEnabled`,
+`autoCompactWindow` and `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`. Those are **Claude Code
+settings and environment keys and do not exist for Codex CLI** — deliberately not
+copied here, because a config key that silently does nothing is worse than no
+guidance (that is exactly how `compactThreshold` sat in a settings file doing
+nothing until it was verified and removed on 2026-08-31). For Codex, use
+`session-rollover status` and the token thresholds in the automation section below.
+
+## Session Rollover
+
+Enforce at the threshold the tooling actually uses: `TEA_ROLLOVER_TURNS`,
+**default 12** (see the automation section below). Do not wait for context to fill.
+
+This number differs from the Claude variant on purpose. Claude Code fires its own
+turn-counter hook at 8, so that file says 8-10; Codex rolls over on TEA's threshold.
+Stating 8-10 here would be prose contradicting the implementation in the same file.
+
+1. Write a compact handoff to the memory vault: project label, current state, next
+   actions, open blockers.
+2. Tell the user the turn count and that the handoff is saved, and suggest a fresh
+   session for clean context.
+3. Stop adding new work after the handoff.
+
+Rationale: work tends to continue until the session breaks. Proactive rollover
+prevents context drift and lost state — **the handoff IS the continuity**, so it is
+written before it is needed, not when the session is already failing.
+
+Rollover stays in the same Codex project/workspace and the same cwd/repo unless the
+user explicitly asks to move. Turn/token thresholds and `session-rollover status`
+are covered in the automation section below.
+
+## Memory Hygiene — volatile facts and pending items
+
+Applies to every handoff and memory file this pipeline writes (rule 5 above).
+Changes HOW memory is written — no new store, no new file, no new tooling.
+
+1. **A volatile fact carries how to re-verify it**, inline:
+
+       - [VOLATILE: re-run scripts/check_graph_fresh.py] graph FRESH at commit 4adcfab
+       - [VOLATILE: check `git log`] other session holds uncommitted edits
+       - [VOLATILE: netstat + /api/health] server restart still pending
+
+   Never repeat a `[VOLATILE: ...]` line as current without running its stated
+   check first — including if you wrote it yourself, minutes ago.
+
+   NOT volatile: rules, decisions, root causes, measured constants, "why we
+   chose X". Those are the memory worth keeping. Do not mark them, or the
+   marker stops meaning anything.
+
+2. **Pending items are checkbox facts, not prose:**
+
+       - [ ] OPEN — restart 8766; carries the row-801 base_count fix
+       - [x] DONE 4adcfab — polymarket probe gap (rows 812/813)
+       - [~] SUPERSEDED — see project_pending_master_2026-09-09
+
+   Prose hides its own staleness: nothing shows that line 40 went false while
+   line 12 stayed true, so the file rots as a unit and is re-read as uniformly
+   current. A checkbox flips in one character; a paragraph needs a rewrite,
+   which is why it does not happen.
+
+3. **Any file using this notation carries the key inline, at the top.** An
+   encoding whose meaning lives in a different file is not readable — a reader
+   sees `[~] SUPERSEDED` with nothing saying it is binding. Four lines of
+   legend costs nothing.
+
+4. **One pending file per project per day.** Never a topic suffix: a variant
+   name creates a second competing "READ FIRST" and a reader cannot tell which
+   is current. Concurrent sessions each own a `## Session <id8>` section and
+   edit only their own; `memory-vault/session-state/<session-id>.json` already
+   keys state by session, so nothing new is needed for that.
+
+Evidence, one session, 2026-09-08: three memory lines went false within hours of
+being written ("those test failures are open" — just fixed; "graph FRESH at
+<sha>" — true for minutes; "other session has uncommitted edits" — they
+committed). A 179-line prose handover kept asserting a fixed item was open
+because marking it done meant rewriting the paragraph around it.
+
+## Project Ledgers — bugs & mistakes (per-project, not memory-vault)
+
+Two plain files live inside each project's own repo — NOT in `memory-vault`,
+specifically so they survive `memory-refresh prune` and persist for the life
+of the project instead of a session:
+
+- **`.crisp/BUGS.md`** — every real bug found and fixed. One entry: date,
+  symptom, root cause, fix (commit hash if committed), status.
+- **`.crisp/MISTAKES.md`** — lessons from actual mistakes (mine, or the user's
+  correction of mine). One entry: date, what happened, why it was wrong, what
+  to do differently.
+
+Codex has no Stop hook to auto-scan a transcript the way Claude Code does, so
+this is a direct instruction rather than automation: when you recognize you
+made a mistake, or find and fix a real bug, append the entry yourself before
+moving on — don't wait to be asked. Both files are created on first use,
+ordinary markdown, git-tracked like any other project file.
+
+## Commit & PR Discipline (no new tracker — `gh` already is one)
+
+No separate PR-tracking system: `gh pr list`/`gh pr view` already shows every
+open PR, `gh issue list` already shows every open bug worth formally tracking.
+
+- Every commit message explains **why**, not just what.
+- Every PR description explains why this change, links the issue it closes
+  (`Closes #N`) if one exists, and states how it was verified.
+- A bug worth a formal `gh issue` (vs. just a `.crisp/BUGS.md` line) is one
+  that needs to be tracked, assigned, or referenced across multiple PRs.
+
+## Task Routing Heuristic (judgment, not automation)
+
+A decision rubric applied by judgment — no cost telemetry wired in to make it
+mechanical.
+
+- Independent subtasks, no shared state → parallel. Stage 2 needs stage 1's
+  output → sequential.
+- Open-ended search, audits, anything that would bloat this session's context
+  → delegate and keep only the summary. A known file with a specific edit →
+  inline.
+- Default to the session's model/effort; reserve a higher tier for genuinely
+  hard judgment calls, not routine work.
+- A second independent verification pass earns its cost for destructive
+  operations, security-sensitive code, or anything hard to reverse — not for
+  exploratory or low-stakes work.
+
+<!-- CRISP:AUTOMATION_SNIPPET:START -->
+<!-- Content below is copied verbatim from engine/adapters/codex/AUTOMATION_AGENTS_SNIPPET.md
+     by install.ps1/install.sh — edit the source file there, not here, so re-installs don't
+     silently drop your customizations. -->
+
+## Token Efficient Automation
+
+Use the `token-efficient-agent` MCP server by default when available.
+
+At task start:
+- Call `observe_search` or `memory_health` only when prior context is likely useful.
+- Keep recalled memory small: 3-5 facts max.
+
+During shell-heavy tasks:
+- Prefer `tea run --label "<task>" -- <command>` for commands where token metrics and compact observations are useful.
+- For normal tool calls, summarize long output compactly and preserve exact paths, commands, errors, IDs, dates, and code names.
+
+At task end:
+- Call `observe_add` with a compact non-secret summary of durable facts, decisions, commands that worked, and unresolved blockers.
+- Do not save secrets, raw private documents, API keys, passwords, tokens, or sensitive personal information.
+- Use `memory_health` if memory seems large or stale.
+- For non-trivial tool/code tasks, include a visible compact receipt in the final reply:
+  `Token receipt: stats <events>, saved <tokens_saved_est> est (<saved_percent_est>%); rollover <turns>/<threshold>, tokens <tokens>/<token_threshold>.`
+- Build the receipt from `node <CRISP_HOME>\cli\tea.js receipt`; omit it for tiny Q&A where running extra commands would waste more tokens than it saves.
+- Codex notify can track session rollover when configured through `adapters\codex\notify-multiplexer.ps1`.
+- If a session is getting long, check `session-rollover status`; suggest a new chat when the turn threshold or optional token threshold is reached.
+- Rollover must stay in the same Codex project/workspace and same cwd/repo unless the user explicitly asks to move.
+
+Session rollover:
+- Default turn target: `TEA_ROLLOVER_TURNS`, default `12`.
+- Optional estimated token target: `TEA_ROLLOVER_TOKENS`, default `0` disabled.
+- Handoffs are saved under `memory-vault\session-handoffs`.
+- Handoff prompts include the project label and cwd so the next chat can resume in the same project.
+
+Memory cleanup:
+- Never delete memory automatically.
+- Use `memory-refresh plan --days 365` first.
+- Delete only after explicit user approval with `memory-refresh prune --days 365 --confirm`.
+<!-- CRISP:AUTOMATION_SNIPPET:END -->
+
+## Wiring (what install.ps1/install.sh actually sets up)
+
+1. **MCP server** — registers `token-efficient-agent` in `config.toml`:
+   ```toml
+   [mcp_servers.token-efficient-agent]
+   command = "node"
+   args = ["<CRISP_HOME>/mcp-server/server.js"]
+   ```
+   `config.toml` is never auto-edited (it can hold secrets) — the installer prints
+   this block for you to paste in.
+
+2. **Notify wiring** (for session-rollover turn tracking) — points Codex's `notify`
+   at `engine/adapters/codex/notify-multiplexer.ps1`, which chains any notify command
+   you already had (set via `CRISP_CODEX_EXISTING_NOTIFY`) with
+   `notify-token-efficient.ps1`, which forwards the event into the same
+   `tea-lifecycle-hook.js` that Claude Code uses — one shared lifecycle engine
+   behind both hosts.
+
+3. **This file** — the installer appends the automation snippet above into your
+   real `~/.codex/AGENTS.md` (between the `CRISP:AUTOMATION_SNIPPET` markers, so
+   re-running the installer updates in place instead of duplicating).
+
+See `<CRISP_HOME>/adapters/codex/README.md` for the full manual-install steps if
+you'd rather not use the installer.

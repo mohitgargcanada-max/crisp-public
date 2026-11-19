@@ -1,0 +1,531 @@
+"use strict";
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const END_EVENTS = new Set(["TaskCompleted", "Stop", "SessionEnd", "PostCompact"]);
+const PROFILE_EVENTS = {
+  minimal: new Set(["SessionStart", "UserPromptSubmit", "TaskCompleted", "Stop", "SessionEnd", "PostCompact"]),
+  standard: new Set([
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "TaskCompleted",
+    "Stop",
+    "StopFailure",
+    "SessionEnd",
+    "PreCompact",
+    "PostCompact",
+    "CwdChanged",
+  ]),
+  strict: null,
+};
+
+// Walk up from cwd to the git repo root. A session started in any
+// subdirectory (or a subagent's own scratch dir) must still resolve to the
+// real project, not that subdirectory's own name -- this is the single
+// shared implementation; callers that used to inline path.basename(cwd) or
+// duplicate this walk should import it from here instead.
+// Mirrors auto_handover.py's _repo_root() (Python side, fixed 2026-09-10 for
+// the same root cause). Falls back to cwd when no .git is found above it.
+// Also resolves through a git WORKTREE's .git file (fixed 2026-09-30, same
+// fix applied to all 4 copies of this function across the JS/Python hooks --
+// a worktree's .git is a FILE containing "gitdir: <main-repo>/.git/worktrees/
+// <name>", and the old code treated that file's presence the same as a normal
+// clone's .git directory, so every agent worktree minted its own phantom
+// vault "project" just like the pre-2026-09-10 subdirectory bug this whole
+// function exists to fix. Confirmed live against a real worktree on disk.
+function repoRoot(cwd) {
+  let here;
+  try { here = path.resolve(cwd); } catch { return cwd; }
+  let dir = here;
+  while (true) {
+    try {
+      const gitPath = path.join(dir, ".git");
+      const stat = fs.existsSync(gitPath) ? fs.statSync(gitPath) : null;
+      if (stat && stat.isDirectory()) return dir;
+      if (stat && stat.isFile()) {
+        let content = "";
+        try { content = fs.readFileSync(gitPath, "utf8").trim(); } catch { /* ignore */ }
+        if (/^gitdir:/i.test(content)) {
+          const raw = content.split(":").slice(1).join(":").trim();
+          const normalized = raw.replace(/\\/g, "/");
+          const marker = "/.git/worktrees/";
+          const idx = normalized.indexOf(marker);
+          // Slice the ORIGINAL (native-separator) string at the same offset,
+          // not the forward-slash copy used only to find the marker -- the
+          // forward-slash copy is the same length, so the offset lines up,
+          // and this keeps the return value in the platform's native format
+          // like every other branch of this function does.
+          if (idx !== -1) return path.normalize(raw.slice(0, idx));
+        }
+        return dir;
+      }
+    } catch { /* ignore and keep walking */ }
+    const parent = path.dirname(dir);
+    if (parent === dir) return here;
+    dir = parent;
+  }
+}
+
+function repoRootName(cwd) {
+  return path.basename(repoRoot(cwd));
+}
+
+function safeSlug(value, fallback = "item") {
+  const slug = String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  return slug || fallback;
+}
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function readJsonl(file) {
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      try { return JSON.parse(line); } catch { return null; }
+    })
+    .filter(Boolean);
+}
+
+function appendJsonl(file, row) {
+  ensureDir(path.dirname(file));
+  fs.appendFileSync(file, JSON.stringify(row) + "\n", "utf8");
+}
+
+function writeJsonl(file, rows) {
+  ensureDir(path.dirname(file));
+  fs.writeFileSync(file, rows.map((r) => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : ""), "utf8");
+}
+
+function shouldRunHook(event, host = "") {
+  const profileName = String(process.env.TEA_HOOK_PROFILE || "standard").trim().toLowerCase();
+  const profile = Object.prototype.hasOwnProperty.call(PROFILE_EVENTS, profileName) ? profileName : "standard";
+  const allowed = PROFILE_EVENTS[profile];
+  if (allowed && !allowed.has(event)) return false;
+
+  const disabled = String(process.env.TEA_DISABLED_HOOKS || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => item.toLowerCase());
+  const keys = [
+    event,
+    `${host}:${event}`,
+    `${profile}:${event}`,
+  ].map((item) => item.toLowerCase());
+  return !disabled.some((item) => keys.includes(item));
+}
+
+function toNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function extractUsageFromMessage(message) {
+  const usage = message && message.usage ? message.usage : {};
+  const details = usage.input_tokens_details || usage.prompt_tokens_details || {};
+  return {
+    inputTokens: toNumber(usage.input_tokens),
+    outputTokens: toNumber(usage.output_tokens),
+    cacheWriteTokens: toNumber(usage.cache_creation_input_tokens),
+    cacheReadTokens: toNumber(usage.cache_read_input_tokens),
+    cachedTokens: toNumber(details.cached_tokens || usage.cached_tokens),
+    model: message && message.model ? String(message.model) : "unknown",
+  };
+}
+
+function readTranscriptUsage(transcriptPath) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
+  let latest = null;
+  const total = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheWriteTokens: 0,
+    cacheReadTokens: 0,
+    cachedTokens: 0,
+    model: "unknown",
+    assistantTurns: 0,
+  };
+
+  for (const line of fs.readFileSync(transcriptPath, "utf8").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let row = null;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (row.type !== "assistant" || !row.message || !row.message.usage) continue;
+    const usage = extractUsageFromMessage(row.message);
+    total.inputTokens += usage.inputTokens;
+    total.outputTokens += usage.outputTokens;
+    total.cacheWriteTokens += usage.cacheWriteTokens;
+    total.cacheReadTokens += usage.cacheReadTokens;
+    total.cachedTokens += usage.cachedTokens;
+    if (usage.model !== "unknown") total.model = usage.model;
+    total.assistantTurns += 1;
+    latest = usage;
+  }
+
+  if (!latest) return null;
+  const latestContextTokens = latest.inputTokens + latest.cacheWriteTokens + latest.cacheReadTokens + latest.cachedTokens;
+  return {
+    latestContextTokens,
+    latest,
+    total,
+  };
+}
+
+function contextWindowTokens(model, latestContextTokens) {
+  // Explicit override wins, e.g. TEA_CONTEXT_WINDOW=1000000.
+  const env = Number(process.env.TEA_CONTEXT_WINDOW);
+  if (Number.isFinite(env) && env > 0) return env;
+  const lower = String(model || "").toLowerCase();
+  // Matching only the literal string "1m" scored every 1M-window model against
+  // 200k. Measured 2026-09-09 on claude-opus-5: this hook reported "198k tokens
+  // (99% of 200k window)" and pushed for a handover while the client's own
+  // meter read 20% -- 198k of a real 1M window. The model name never contains
+  // "1m", so the fallback silently applied to the models it most needed to get
+  // right. Name the families instead, and keep the observed-tokens escape hatch
+  // below as a backstop for a model this list does not know yet.
+  if (lower.includes("1m")) return 1000000;
+  if (/(opus|sonnet|fable)-(5|[6-9])/.test(lower)) return 1000000;
+  if (latestContextTokens > 200000) return 1000000;
+  return 200000;
+}
+
+const CONTEXT_WARN_FRACTION = 0.70;
+
+function contextThreshold(windowTokens) {
+  const value = process.env.TEA_CONTEXT_THRESHOLD;
+  const raw = value === undefined || value === "" ? Number.NaN : Number(value);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  // Warn at a FRACTION of the real window (Mohit, 2026-09-09: "make it 70%").
+  // Previously two absolute constants (160k / 250k), which is why a wrong
+  // window produced both a wrong percentage and a wrong warning point.
+  return Math.round(windowTokens * CONTEXT_WARN_FRACTION);
+}
+
+function contextInterval() {
+  const value = process.env.TEA_CONTEXT_INTERVAL;
+  const raw = value === undefined || value === "" ? Number.NaN : Number(value);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60000;
+}
+
+function contextBucket(tokens, threshold, interval) {
+  if (threshold <= 0 || tokens < threshold) return -1;
+  return Math.floor((tokens - threshold) / interval);
+}
+
+function contextStateFile(memoryDir, sessionId) {
+  return path.join(memoryDir, "session-state", `${safeSlug(sessionId)}.context.json`);
+}
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(file, value) {
+  ensureDir(path.dirname(file));
+  fs.writeFileSync(file, JSON.stringify(value, null, 2), "utf8");
+}
+
+// Exported so other hooks resolve the window through this one definition. The
+// 2026-09-09 bug was a single wrong constant read in a single place; a second
+// copy of the model list elsewhere would re-create it on the next model launch.
+function contextWindowForTranscript(transcriptPath) {
+  const usage = readTranscriptUsage(transcriptPath);
+  if (!usage) return null;
+  return {
+    windowTokens: contextWindowTokens(usage.total.model, usage.latestContextTokens),
+    latestContextTokens: usage.latestContextTokens,
+    model: usage.total.model,
+  };
+}
+
+function contextSuggestion({ memoryDir, sessionId, transcriptPath }) {
+  const usage = readTranscriptUsage(transcriptPath);
+  if (!usage) return "";
+  const windowTokens = contextWindowTokens(usage.total.model, usage.latestContextTokens);
+  const threshold = contextThreshold(windowTokens);
+  const interval = contextInterval();
+  const bucket = contextBucket(usage.latestContextTokens, threshold, interval);
+  if (bucket < 0) return "";
+
+  const file = contextStateFile(memoryDir, sessionId || "default");
+  const state = readJson(file, { lastBucket: -1 });
+  if (bucket <= Number(state.lastBucket || -1)) return "";
+  writeJson(file, {
+    lastBucket: bucket,
+    latestContextTokens: usage.latestContextTokens,
+    windowTokens,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const approx = `${Math.round(usage.latestContextTokens / 1000)}k`;
+  const percent = Math.round((usage.latestContextTokens / windowTokens) * 100);
+  return `Token-kit context: about ${approx} tokens (${percent}% of ${Math.round(windowTokens / 1000)}k window). Prepare a compact handoff at the next natural boundary; do not interrupt active work.`;
+}
+
+function costMetricsPath(memoryDir) {
+  return path.join(memoryDir, "metrics", "costs.jsonl");
+}
+
+function hostCost(payload = {}) {
+  const direct = payload.cost_usd || payload.total_cost_usd || payload.estimated_cost_usd;
+  const nested = payload.cost && (payload.cost.total_cost_usd || payload.cost.estimated_cost_usd);
+  const value = Number(direct ?? nested);
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function recordCostSnapshot({ memoryDir, payload = {}, host = "unknown", event = "", sessionId = "" }) {
+  if (!END_EVENTS.has(event)) return null;
+  const transcriptPath = typeof payload.transcript_path === "string" ? payload.transcript_path : "";
+  const usage = readTranscriptUsage(transcriptPath);
+  if (!usage) return null;
+  const row = {
+    timestamp: new Date().toISOString(),
+    host,
+    event,
+    session_id: sessionId || payload.session_id || payload.sessionId || "default",
+    transcript_path: transcriptPath,
+    model: usage.total.model,
+    assistant_turns: usage.total.assistantTurns,
+    input_tokens: usage.total.inputTokens,
+    output_tokens: usage.total.outputTokens,
+    cache_write_tokens: usage.total.cacheWriteTokens,
+    cache_read_tokens: usage.total.cacheReadTokens,
+    cached_tokens: usage.total.cachedTokens,
+    latest_context_tokens: usage.latestContextTokens,
+    estimated_cost_usd: hostCost(payload),
+  };
+  appendJsonl(costMetricsPath(memoryDir), row);
+  return row;
+}
+
+function readCostSnapshots(memoryDir) {
+  return readJsonl(costMetricsPath(memoryDir));
+}
+
+function summarizeCost(memoryDir) {
+  const rows = readCostSnapshots(memoryDir);
+  const latestBySession = new Map();
+  for (const row of rows) {
+    const key = row.session_id || row.transcript_path || row.timestamp;
+    const prev = latestBySession.get(key);
+    if (!prev || String(row.timestamp) > String(prev.timestamp)) latestBySession.set(key, row);
+  }
+  const latest = Array.from(latestBySession.values());
+  const totals = latest.reduce((acc, row) => {
+    acc.sessions += 1;
+    acc.inputTokens += toNumber(row.input_tokens);
+    acc.outputTokens += toNumber(row.output_tokens);
+    acc.cacheWriteTokens += toNumber(row.cache_write_tokens);
+    acc.cacheReadTokens += toNumber(row.cache_read_tokens);
+    acc.cachedTokens += toNumber(row.cached_tokens);
+    if (row.estimated_cost_usd !== null && row.estimated_cost_usd !== undefined) {
+      acc.estimatedCostUsd += toNumber(row.estimated_cost_usd);
+      acc.costRows += 1;
+    }
+    return acc;
+  }, { sessions: 0, inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, cachedTokens: 0, estimatedCostUsd: 0, costRows: 0 });
+  return {
+    metricsFile: costMetricsPath(memoryDir),
+    rows: rows.length,
+    latest,
+    totals,
+  };
+}
+
+function instinctId() {
+  return `ins_${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}_${process.pid}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function instinctsPath(memoryDir, project, scope = "project") {
+  if (scope === "global") return path.join(memoryDir, "instincts", "global.jsonl");
+  return path.join(memoryDir, "projects", safeSlug(project, "unassigned"), "instincts.jsonl");
+}
+
+function readInstincts(memoryDir, project = "") {
+  return [
+    ...readJsonl(instinctsPath(memoryDir, "", "global")),
+    ...readJsonl(instinctsPath(memoryDir, project, "project")),
+  ];
+}
+
+function saveInstinct(memoryDir, instinct) {
+  const action = String(instinct.action || "").trim();
+  if (!action) throw new Error("Missing instinct action");
+  const scope = instinct.scope === "global" ? "global" : "project";
+  const project = instinct.project || "unassigned";
+  const row = {
+    id: instinct.id || instinctId(),
+    ts: instinct.ts || new Date().toISOString(),
+    scope,
+    project: scope === "global" ? "" : project,
+    trigger: instinct.trigger || "when relevant",
+    action,
+    domain: instinct.domain || "workflow",
+    confidence: Math.max(0.1, Math.min(1, Number(instinct.confidence || 0.7))),
+    evidence: instinct.evidence || "",
+  };
+  const file = instinctsPath(memoryDir, project, scope);
+  const existing = readJsonl(file);
+  const duplicate = existing.find((item) => String(item.action || "").toLowerCase() === row.action.toLowerCase());
+  if (duplicate) return { file, row: duplicate, duplicate: true };
+  appendJsonl(file, row);
+  return { file, row, duplicate: false };
+}
+
+function scoreInstinct(row, terms) {
+  const haystack = `${row.id} ${row.scope} ${row.project} ${row.trigger} ${row.action} ${row.domain}`.toLowerCase();
+  const termScore = terms.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0);
+  return termScore + Number(row.confidence || 0);
+}
+
+function recallInstincts(memoryDir, project = "", query = "", limit = 6) {
+  const terms = String(query || "")
+    .toLowerCase()
+    .split(/[^a-z0-9._-]+/)
+    .filter(Boolean);
+  return readInstincts(memoryDir, project)
+    .map((row) => ({ ...row, score: terms.length ? scoreInstinct(row, terms) : Number(row.confidence || 0) }))
+    .filter((row) => !terms.length || row.score > Number(row.confidence || 0))
+    .sort((a, b) => b.score - a.score || String(b.ts).localeCompare(String(a.ts)))
+    .slice(0, limit);
+}
+
+function activeInstinctContext(memoryDir, project = "", query = "") {
+  const minConfidence = Math.max(0, Math.min(1, Number(process.env.TEA_INSTINCT_CONFIDENCE || 0.7)));
+  const limit = Math.max(1, Math.min(12, Number(process.env.TEA_MAX_INJECTED_INSTINCTS || 6)));
+  const hits = recallInstincts(memoryDir, project, query, limit)
+    .filter((row) => Number(row.confidence || 0) >= minConfidence);
+  if (!hits.length) return "";
+  return [
+    "Active token-kit learned patterns:",
+    ...hits.map((row) => `- [${row.scope} ${Math.round(Number(row.confidence || 0) * 100)}%] ${row.action}`),
+  ].join("\n");
+}
+
+function promptText(payload = {}) {
+  return String(payload.prompt || payload.message || payload.user_prompt || payload.text || "").trim();
+}
+
+function learnInstinctFromPrompt({ memoryDir, payload = {}, project = "" }) {
+  const text = promptText(payload).replace(/\s+/g, " ").trim();
+  if (!text || text.length > 1200) return null;
+  if (!/\b(always|never|remember|from now on|for this project|preference|prefer)\b/i.test(text)) return null;
+  if (/(api[_-]?key|secret|password|passwd|oauth|bearer\s+[a-z0-9._-]+|sk-[a-z0-9_-]{12,}|token\s*[:=]|private key|recovery phrase)/i.test(text)) return null;
+
+  // A directive is not a description. "always run tests" is a standing rule;
+  // "X is always incremental" is a statement of fact and must never become a
+  // preference. Storing the raw prompt prefix conflated the two: it captured
+  // "i thought graifyf is always incremental" and "u will always find darvas"
+  // as 0.75-confidence preferences and replayed them into every prompt.
+  const DESCRIPTIVE = /\b(?:is|are|was|were|will|would|has|have|had|thought|think|thinks|seems|seemed|feels|becomes|got|gets)\s+(?:not\s+)?(?:always|never)\b/i;
+  const DIRECTIVE = /(?:^|[.!?;:,]\s*|\b(?:so|and|but|then|also|please)\s+)((?:please\s+)?(?:always|never|from now on|remember to|make sure to|be sure to|don'?t)\b[^.!?;]{4,180})/i;
+  const PREFER = /((?:i\s+)?prefer\s+[^.!?;]{4,180})/i;
+
+  // Judge each clause alone, so a descriptive "always" cannot drag in an
+  // unrelated directive elsewhere in the message, or vice versa.
+  let action = null;
+  for (const clause of text.split(/(?<=[.!?;])\s+|\s*\.{3,}\s*/)) {
+    const c = clause.trim();
+    if (c.length < 12 || c.length > 200) continue;
+    if (DESCRIPTIVE.test(c)) continue;
+    if (/\?\s*$/.test(c)) continue;
+    const m = DIRECTIVE.exec(c) || PREFER.exec(c);
+    if (m) { action = m[1].trim(); break; }
+  }
+  if (!action) return null;
+
+  // Default scope is now PROJECT, not global -- a bare "always X" said inside
+  // one project used to leak into every other project's sessions (confirmed:
+  // a one-project scan instinct was injecting into unrelated CRISP-toolkit
+  // sessions). Global now requires an explicit everywhere/all-projects signal.
+  const explicitProject = /\b(for this project|in this repo|this repo|this project)\b/i.test(text);
+  const explicitGlobal = /\b(everywhere|every project|all projects|globally|every repo|across (?:all )?projects|in every repo)\b/i.test(text);
+  const scope = explicitGlobal && !explicitProject ? "global" : "project";
+
+  // New instincts start as a silent, unreviewed CANDIDATE (confidence well
+  // below the 0.7 injection floor in activeInstinctContext), not live
+  // immediately. Nothing auto-promotes; `tea instincts promote <id>` does.
+  return saveInstinct(memoryDir, {
+    scope,
+    project,
+    trigger: "user-stated preference (unreviewed candidate)",
+    action: action.slice(0, 300),
+    domain: "preference",
+    confidence: 0.45,
+    evidence: "captured from explicit user wording; run `tea instincts promote <id>` to activate",
+  });
+}
+
+function findInstinctFile(memoryDir, id) {
+  const globalFile = instinctsPath(memoryDir, "", "global");
+  if (readJsonl(globalFile).some((row) => row.id === id)) return globalFile;
+  const projectsDir = path.join(memoryDir, "projects");
+  if (!fs.existsSync(projectsDir)) return null;
+  for (const name of fs.readdirSync(projectsDir)) {
+    const file = path.join(projectsDir, name, "instincts.jsonl");
+    if (readJsonl(file).some((row) => row.id === id)) return file;
+  }
+  return null;
+}
+
+function promoteInstinct(memoryDir, id, confidence) {
+  const file = findInstinctFile(memoryDir, id);
+  if (!file) return null;
+  const rows = readJsonl(file);
+  const row = rows.find((r) => r.id === id);
+  if (!row) return null;
+  row.confidence = Math.max(0.1, Math.min(1, Number(confidence || 0.85)));
+  row.evidence = [row.evidence, "promoted by user"].filter(Boolean).join(" | ");
+  writeJsonl(file, rows);
+  return row;
+}
+
+function dropInstinct(memoryDir, id) {
+  const file = findInstinctFile(memoryDir, id);
+  if (!file) return null;
+  const rows = readJsonl(file);
+  const remaining = rows.filter((row) => row.id !== id);
+  if (remaining.length === rows.length) return null;
+  writeJsonl(file, remaining);
+  return true;
+}
+
+module.exports = {
+  CONTEXT_WARN_FRACTION,
+  END_EVENTS,
+  activeInstinctContext,
+  contextSuggestion,
+  contextWindowForTranscript,
+  contextWindowTokens,
+  dropInstinct,
+  findInstinctFile,
+  learnInstinctFromPrompt,
+  promoteInstinct,
+  readCostSnapshots,
+  readInstincts,
+  recallInstincts,
+  recordCostSnapshot,
+  repoRoot,
+  repoRootName,
+  saveInstinct,
+  shouldRunHook,
+  summarizeCost,
+};
